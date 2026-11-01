@@ -1,6 +1,7 @@
 """Binance USDT-M Futures tarayici MCP sunucusu (sadece herkese acik veri, API anahtari yok)."""
 import asyncio
 import os
+import time
 
 import httpx
 from mcp.server.fastmcp import FastMCP
@@ -9,6 +10,7 @@ BASE = os.environ.get("BINANCE_FAPI", "https://fapi.binance.com")
 PORT = int(os.environ.get("PORT", "8000"))
 PATH = os.environ.get("MCP_PATH", "/mcp")
 INTERVALS = {"1m", "3m", "5m", "15m", "30m", "1h", "4h"}
+BANNED_UNTIL = 0.0
 
 kwargs = dict(host="0.0.0.0", port=PORT, streamable_http_path=PATH, stateless_http=True)
 try:
@@ -21,6 +23,10 @@ except Exception:
     pass
 
 mcp = FastMCP("binance-futures-scanner", **kwargs)
+
+
+class Blocked(Exception):
+    pass
 
 
 def ema(vals, n):
@@ -117,12 +123,29 @@ def analyze(symbol, rows):
 
 
 async def _get(client, path, params=None):
-    r = await client.get(BASE + path, params=params, timeout=15)
-    r.raise_for_status()
-    return r.json()
+    global BANNED_UNTIL
+    if time.time() < BANNED_UNTIL:
+        raise Blocked()
+    for attempt in range(2):
+        r = await client.get(BASE + path, params=params, timeout=15)
+        if r.status_code in (418, 429):
+            wait = int(r.headers.get("Retry-After", "60"))
+            if r.status_code == 418 or attempt == 1:
+                BANNED_UNTIL = time.time() + wait
+                raise Blocked()
+            await asyncio.sleep(min(wait, 5))
+            continue
+        r.raise_for_status()
+        return r.json()
 
 
 def _err(e):
+    if isinstance(e, Blocked):
+        kalan = max(0, int(BANNED_UNTIL - time.time()))
+        return {
+            "error": f"Binance bu sunucunun IP'sini gecici engelledi. Yaklasik {kalan} sn sonra tekrar dene.",
+            "blocked_seconds": kalan,
+        }
     if isinstance(e, httpx.HTTPStatusError):
         code = e.response.status_code
         hint = ""
@@ -134,28 +157,34 @@ def _err(e):
 
 @mcp.tool()
 async def scan_movers(
-    min_quote_volume_usdt: float = 100_000_000,
-    max_symbols: int = 40,
+    min_quote_volume_usdt: float = 20_000_000,
+    max_symbols: int = 60,
     interval: str = "5m",
 ) -> dict:
-    """24s USDT hacmi yuksek Binance perp coinlerini tarar, EMA9/EMA21/VWAP14/RSI/rel. hacme gore
-    etiketler (PULLBACK_*, TREND_*, EXTENDED_*, CHOP) ve skora gore siralar."""
+    """Tum Binance USDT perp coinlerini tek istekte (24s ozet) eler: hacim esigini gecenler arasindan
+    gun ici en hareketli olanlari (24s araliginin genisligi ve degisim) secip 5dk mumlarina bakar,
+    EMA9/EMA21/VWAP14/RSI/rel. hacme gore etiketler (PULLBACK_*, TREND_*, EXTENDED_*, CHOP) ve
+    skora gore siralar. max_symbols en fazla 120."""
     if interval not in INTERVALS:
         return {"error": f"interval su olmali: {sorted(INTERVALS)}"}
-    max_symbols = max(1, min(max_symbols, 80))
+    max_symbols = max(1, min(max_symbols, 120))
     try:
         async with httpx.AsyncClient() as client:
             tickers = await _get(client, "/fapi/v1/ticker/24hr")
-            pool = [
-                t
-                for t in tickers
-                if t["symbol"].endswith("USDT")
-                and "_" not in t["symbol"]
-                and float(t["quoteVolume"]) >= min_quote_volume_usdt
+            usdt = [
+                t for t in tickers
+                if t["symbol"].endswith("USDT") and "_" not in t["symbol"]
             ]
-            pool.sort(key=lambda t: float(t["quoteVolume"]), reverse=True)
+            pool = [t for t in usdt if float(t["quoteVolume"]) >= min_quote_volume_usdt]
+
+            def activity(t):
+                last = float(t["lastPrice"]) or 1
+                rng = (float(t["highPrice"]) - float(t["lowPrice"])) / last
+                return rng + abs(float(t["priceChangePercent"])) / 100
+
+            pool.sort(key=activity, reverse=True)
             pool = pool[:max_symbols]
-            sem = asyncio.Semaphore(8)
+            sem = asyncio.Semaphore(3)
 
             async def one(t):
                 async with sem:
@@ -163,21 +192,36 @@ async def scan_movers(
                         rows = await _get(
                             client,
                             "/fapi/v1/klines",
-                            {"symbol": t["symbol"], "interval": interval, "limit": 100},
+                            {"symbol": t["symbol"], "interval": interval, "limit": 99},
                         )
+                    except Blocked:
+                        return "blocked"
                     except Exception:
                         return None
+                    await asyncio.sleep(0.05)
                 a = analyze(t["symbol"], rows)
                 if a:
                     a["change_24h_pct"] = round(float(t["priceChangePercent"]), 2)
                     a["vol_24h_usdt_m"] = round(float(t["quoteVolume"]) / 1e6, 1)
                 return a
 
-            res = [r for r in await asyncio.gather(*[one(t) for t in pool]) if r]
+            raw = await asyncio.gather(*[one(t) for t in pool])
     except Exception as e:
         return _err(e)
+    blocked = sum(1 for r in raw if r == "blocked")
+    res = [r for r in raw if isinstance(r, dict)]
     res.sort(key=lambda r: r["score"], reverse=True)
-    return {"interval": interval, "scanned": len(res), "results": res}
+    out = {
+        "interval": interval,
+        "total_usdt_perps": len(usdt),
+        "passed_volume_filter": len([t for t in usdt if float(t["quoteVolume"]) >= min_quote_volume_usdt]),
+        "candles_checked": len(pool),
+        "scanned_ok": len(res),
+        "results": res,
+    }
+    if blocked:
+        out["warning"] = f"{blocked} coin Binance engeli yuzunden alinamadi."
+    return out
 
 
 @mcp.tool()
@@ -192,7 +236,7 @@ async def get_analysis(symbol: str, interval: str = "5m") -> dict:
                 _get(
                     client,
                     "/fapi/v1/klines",
-                    {"symbol": symbol, "interval": interval, "limit": 100},
+                    {"symbol": symbol, "interval": interval, "limit": 99},
                 ),
                 _get(client, "/fapi/v1/premiumIndex", {"symbol": symbol}),
             )
